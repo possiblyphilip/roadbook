@@ -10,13 +10,13 @@ import serial
 import time
 import math
 import sys
+import traceback
 
 
 # ---------------------- Config ----------------------
 #GPX_FILE = "digicomp_millican.gpx"
 #GPX_FILE = "w_25_r1_tp.gpx"
 #GPX_FILE = "daycare.gpx"
-
 
 if len(sys.argv) < 2:
     print("Usage: python bluetooth_tulip_extractor.py <GPX_FILE>")
@@ -29,15 +29,21 @@ GPS_OUTPUT_PATH = "/tmp/eink_gps.bmp"
 TMP_PATH = "/tmp/eink_note_temp.bmp"
 TMP_GPS_PATH = "/tmp/eink_gps_temp.bmp"
 GPS_LOG_PATH = "gps_track.log"
+SYSTEM_LOG_PATH = "/home/ben/system.log"
 INPUT_EVENT = "/dev/input/event5"
-MOVEMENT_THRESHOLD_KM = 0.005  # ~5 m
-#MOVEMENT_THRESHOLD_KM = 0.0001  # ~5 m
+GPS_DEVICE = "/dev/ttyACM0"
+GPS_BAUDRATE = 9600
+
+MOVEMENT_THRESHOLD_KM = 0.005  # ~5 m
+#MOVEMENT_THRESHOLD_KM = 0.0001  # ~5 m
+
 last_button_time = 0
 DEBOUNCE_MS = 100
 combo_start_time = None
 COMBO_HOLD_MS = 700
 
-gps_port = serial.Serial("/dev/ttyACM0", baudrate=9600, timeout=1)
+gps_port = None
+gps_lock = threading.Lock()
 
 last_latlon = None
 total_distance_km = 0.0
@@ -58,23 +64,58 @@ root = tree.getroot()
 waypoints = root.findall('default:wpt', ns)
 pressed_keys = set()
 
-
-from time import time as now  # add at the top with imports
-
+from time import time as now
 
 font_large = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 90)
 font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 30)
 font_marker = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 60)
-
-
-
-
 
 special_tags = [
     'dss', 'ass', 'dz', 'fz', 'wpm', 'wpe', 'wps', 'wpc',
     'wpv', 'wpp', 'wpn', 'checkpoint', 'fn', 'dt', 'ft', 'neutralization', 'speed'
 ]
 
+
+def log_system_line(message):
+    try:
+        os.makedirs(os.path.dirname(SYSTEM_LOG_PATH), exist_ok=True)
+        with open(SYSTEM_LOG_PATH, "a") as log:
+            log.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {message}\n")
+    except Exception:
+        pass
+
+
+def open_gps():
+    return serial.Serial(GPS_DEVICE, baudrate=GPS_BAUDRATE, timeout=1)
+
+
+def recover_gps(reason="unknown"):
+    global gps_port
+
+    with gps_lock:
+        log_system_line(f"[GPS RECOVER] reason={reason}")
+
+        try:
+            if gps_port is not None:
+                gps_port.close()
+        except Exception as e:
+            log_system_line(f"[GPS CLOSE ERROR] {e}")
+
+        gps_port = None
+        time.sleep(1)
+
+        try:
+            gps_port = open_gps()
+            flushed = 0
+            while gps_port.in_waiting:
+                gps_port.readline()
+                flushed += 1
+            log_system_line(f"[GPS OPEN OK] device={GPS_DEVICE} flushed={flushed}")
+            return True
+        except Exception as e:
+            gps_port = None
+            log_system_line(f"[GPS OPEN FAILED] device={GPS_DEVICE} error={e}")
+            return False
 
 
 for wpt in waypoints:
@@ -95,7 +136,7 @@ for wpt in waypoints:
                 if speed_elem is not None and speed_elem.text:
                     try:
                         speed_value = float(speed_elem.text)
-                    except:
+                    except Exception:
                         pass
 
                 special_wpts.append({
@@ -110,50 +151,50 @@ for wpt in waypoints:
 
 special_idx = 0
 
-
 print(f"Total tagged waypoints: {waypoint_count}")
 
-
-
-
-# Empty GPS serial buffer on startup
-while gps_port.in_waiting:
-    gps_port.readline()
+# Open GPS on startup, but don't die if it fails
+recover_gps("startup")
 
 
 # ---------------------- GPS Functions ----------------------
 def haversine(lat1, lon1, lat2, lon2):
     R = 6371.0
-    φ1, λ1 = math.radians(lat1), math.radians(lon1)
-    φ2, λ2 = math.radians(lat2), math.radians(lon2)
-    dφ, dλ = φ2 - φ1, λ2 - λ1
-    a = math.sin(dφ/2)**2 + math.cos(φ1)*math.cos(φ2)*math.sin(dλ/2)**2
-    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+    phi1, lam1 = math.radians(lat1), math.radians(lon1)
+    phi2, lam2 = math.radians(lat2), math.radians(lon2)
+    dphi, dlam = phi2 - phi1, lam2 - lam1
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlam / 2) ** 2
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
 
 def bearing(lat1, lon1, lat2, lon2):
-    φ1, φ2 = math.radians(lat1), math.radians(lat2)
-    dλ = math.radians(lon2 - lon1)
-    x = math.sin(dλ) * math.cos(φ2)
-    y = math.cos(φ1) * math.sin(φ2) - math.sin(φ1)*math.cos(φ2)*math.cos(dλ)
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dlam = math.radians(lon2 - lon1)
+    x = math.sin(dlam) * math.cos(phi2)
+    y = math.cos(phi1) * math.sin(phi2) - math.sin(phi1) * math.cos(phi2) * math.cos(dlam)
     return (math.degrees(math.atan2(x, y)) + 360) % 360
 
+
 def update_gps():
-    global last_latlon, total_distance_km, heading_deg, special_idx, current_speed_kmh, current_speed_limit, show_speed
+    global last_latlon, total_distance_km, heading_deg
+    global special_idx, current_speed_kmh, current_speed_limit, show_speed, gps_port
 
     def parse_lat(parts):
-        # parts[3]=ddmm.mmmm, parts[4]=N/S
         s = parts[3]
-        if not s: return None
-        deg = float(s[:2]); mins = float(s[2:])
-        lat = deg + mins/60.0
+        if not s:
+            return None
+        deg = float(s[:2])
+        mins = float(s[2:])
+        lat = deg + mins / 60.0
         return -lat if len(parts) > 4 and parts[4] == "S" else lat
 
     def parse_lon(parts):
-        # parts[5]=dddmm.mmmm, parts[6]=E/W
         s = parts[5]
-        if not s: return None
-        deg = float(s[:3]); mins = float(s[3:])
-        lon = deg + mins/60.0
+        if not s:
+            return None
+        deg = float(s[:3])
+        mins = float(s[3:])
+        lon = deg + mins / 60.0
         return -lon if len(parts) > 6 and parts[6] == "W" else lon
 
     line = None
@@ -161,29 +202,44 @@ def update_gps():
     show_speed = False
     current_speed_limit = None
 
-    # Drain serial; keep last $GPRMC
-    while getattr(gps_port, "in_waiting", 0):
-        candidate = gps_port.readline()
-        if candidate.startswith(b"$GPRMC"):
-            line = candidate.decode(errors='ignore').strip()
+    if gps_port is None:
+        if not recover_gps("gps_port is None in update_gps"):
+            return False
+
+    try:
+        with gps_lock:
+            if gps_port is None:
+                return False
+
+            while gps_port.in_waiting:
+                candidate = gps_port.readline()
+                if candidate.startswith(b"$GPRMC"):
+                    line = candidate.decode(errors="ignore").strip()
+
+    except (OSError, serial.SerialException) as e:
+        log_system_line(f"[GPS IO ERROR] during read: {e}")
+        recover_gps(f"serial read failed: {e}")
+        return False
+    except Exception as e:
+        log_system_line(f"[GPS UNKNOWN READ ERROR] {e}")
+        recover_gps(f"unknown read failure: {e}")
+        return False
 
     if not line:
         return False
 
     try:
         parts = line.split(",")
-        # Guard against short/malformed sentences
+
         if not (len(parts) > 7 and parts[2] == "A"):
             return False
 
-        # Speed
         try:
             speed_knots = float(parts[7]) if parts[7] else 0.0
         except ValueError:
             speed_knots = 0.0
         current_speed_kmh = speed_knots * 1.852
 
-        # Position
         lat = parse_lat(parts)
         lon = parse_lon(parts)
         if lat is None or lon is None:
@@ -201,7 +257,6 @@ def update_gps():
                 with open(GPS_LOG_PATH, "a") as f:
                     f.write(f"{time.time()},{lat},{lon},{total_distance_km:.3f},{heading_deg:.1f}\n")
 
-                # --- Update special index / speed display ---
                 if special_idx < len(special_wpts):
                     sp = special_wpts[special_idx]
                     dist_to_sp = haversine(new_point[0], new_point[1], sp["lat"], sp["lon"])
@@ -223,21 +278,18 @@ def update_gps():
 
                 return True
             else:
-                # No significant movement; still OK update
                 return True
         else:
             last_latlon = new_point
             return True
 
     except Exception as e:
-        # Log the raw line for post-mortem instead of crashing
         try:
             with open(GPS_LOG_PATH, "a") as f:
                 f.write(f"{time.time()},NMEA_PARSE_FAIL,{repr(line)},{e}\n")
-        except:
+        except Exception:
             pass
         return False
-
 
 
 # ----------------------- GPS ----------------------
@@ -266,7 +318,7 @@ def render_gps_strip():
     draw.line([(550, 0), (550, 199)], fill=0)
     draw.rectangle([0, 0, 824, 199], outline=0)
 
-        # ---- Add black strip at bottom ----
+    # ---- Add black strip at bottom ----
     draw.rectangle([0, 174, 824, 223], fill=0)
 
     index_str = f"{special_idx}/{waypoint_count}"
@@ -276,15 +328,13 @@ def render_gps_strip():
         speed_str = f"{current_speed_kmh:.0f} / {current_speed_limit:.0f} km/h"
         draw.text((560, 175), speed_str, font=font_small, fill=255)
 
-
-        # ---- Middle Panel: Arrow toward special_idx if inside open radius ----
+    # ---- Middle Panel: Arrow toward special_idx if inside open radius ----
     if special_idx < len(special_wpts):
         sp = special_wpts[special_idx]
         if last_latlon:
             dist_to_sp = haversine(last_latlon[0], last_latlon[1], sp["lat"], sp["lon"])
             print(f"[DEBUG] dist_to_sp = {dist_to_sp:.3f} km")
             if dist_to_sp < sp["open"]:
-      #      if 1:
                 sp_bearing = bearing(last_latlon[0], last_latlon[1], sp["lat"], sp["lon"])
                 rel_bearing = (sp_bearing - heading_deg + 360) % 360
 
@@ -292,7 +342,6 @@ def render_gps_strip():
                 print(f"[DEBUG] heading_deg = {heading_deg:.1f}°")
                 print(f"[DEBUG] rel_bearing = {rel_bearing:.1f}°")
 
-                # Map rel_bearing to arrow direction (up = 0°)
                 center_x, center_y = 412, 100
                 length = 60
                 angle_rad = math.radians(rel_bearing)
@@ -301,10 +350,8 @@ def render_gps_strip():
 
                 print(f"[DEBUG] arrow tip: ({end_x:.1f}, {end_y:.1f})")
 
-                # Draw arrow shaft (thicker)
                 draw.line([(center_x, center_y), (end_x, end_y)], fill=0, width=5)
 
-                # Draw arrowhead (triangle)
                 head_length = 20
                 head_width = 12
                 base_x = end_x - head_length * math.sin(angle_rad)
@@ -321,25 +368,15 @@ def render_gps_strip():
                     (right_x, right_y)
                 ], fill=0)
 
-                                # Draw distance to waypoint in meters (bottom center)
                 meters = int(dist_to_sp * 1000)
                 dist_str = f"{meters} m"
                 dist_bbox = draw.textbbox((0, 0), dist_str, font=font_small)
                 dist_w = dist_bbox[2] - dist_bbox[0]
                 draw.text(((825 - dist_w) // 2, 175), dist_str, font=font_small, fill=255)
 
-
-
-
-
-
-
-    # Rotate and quantize
     final = gps_strip.rotate(90, expand=True).quantize(colors=16)
     final.save(TMP_GPS_PATH, format="BMP")
-    os.replace(TMP_GPS_PATH, GPS_OUTPUT_PATH)  # or your actual GPS BMP path
-
-
+    os.replace(TMP_GPS_PATH, GPS_OUTPUT_PATH)
 
 
 # ---------------------- Helper: Stretch Contrast ----------------------
@@ -353,12 +390,12 @@ def stretch_contrast(img_l):
     else:
         return img_l
 
+
 # ---------------------- Render Row ----------------------
 def render_row(wpt, prev_wpt=None):
     global rendered_special_idx
 
     try:
-        # ---- Partial Distance Calculation ----
         partial = ""
         partial_km = None
         if prev_wpt is not None:
@@ -367,10 +404,9 @@ def render_row(wpt, prev_wpt=None):
                 this_dist = float(wpt.findtext('default:extensions/openrally:distance', default="0", namespaces=ns).replace(",", "."))
                 partial_km = round(this_dist - prev_dist, 2)
                 partial = f"{partial_km:.2f}".replace(".", ",")
-            except:
+            except Exception:
                 pass
 
-        # ---- Load & Process Tulip Image ----
         tulip_b64 = wpt.find('default:extensions/openrally:tulip', ns)
         if tulip_b64 is None or not tulip_b64.text:
             return None
@@ -387,7 +423,6 @@ def render_row(wpt, prev_wpt=None):
         tulip_box.paste(tulip_l, ((275 - tulip_l.width) // 2, (200 - tulip_l.height) // 2))
         tulip_l = tulip_box
 
-        # ---- Load & Process Note Image ----
         note_img = Image.new("L", (275, 200), 255)
         note_b64 = wpt.find('default:extensions/openrally:notes', ns)
         if note_b64 is not None and note_b64.text:
@@ -403,15 +438,12 @@ def render_row(wpt, prev_wpt=None):
                 note_l.thumbnail((275, 200))
                 note_img = Image.new("L", (275, 200), 255)
                 note_img.paste(note_l, ((275 - note_l.width) // 2, (200 - note_l.height) // 2))
-            except:
+            except Exception:
                 pass
 
-        # ---- Build Final Row ----
         final = Image.new("L", (825, 200), 255)
         draw = ImageDraw.Draw(final)
 
-        # ---- Odo Background Fill If Close ----
-# ---- Odo Background Fill If Close or WPS/WPM ----
         if (
             (partial_km is not None and partial_km < 0.3)
             or wpt.find('default:extensions/openrally:wps', ns) is not None
@@ -419,33 +451,25 @@ def render_row(wpt, prev_wpt=None):
         ):
             draw.rectangle([0, 0, 275, 200], fill=192)
 
-
-        # ---- Odometer Main Text ----
         odo = wpt.findtext('default:extensions/openrally:distance', default="", namespaces=ns).replace(".", ",")
         odo_bbox = draw.textbbox((0, 0), odo, font=font_large)
         odo_width = odo_bbox[2] - odo_bbox[0]
-        odo_x = 275 - odo_width - 10  # 10px right padding
+        odo_x = 275 - odo_width - 10
         draw.text((odo_x, 10), odo, font=font_large, fill=0)
 
-        # ---- Draw Partial Box ----
         if partial:
             bbox = draw.textbbox((0, 0), partial, font=font_small)
             text_w = bbox[2] - bbox[0]
-            text_h = bbox[3] - bbox[1]
 
             px = 5
-            py = 200 - font_small.size -3
-            box = [px - 5, py-2, px + text_w + 5, py + font_small.size + 2 ]
+            py = 200 - font_small.size - 3
+            box = [px - 5, py - 2, px + text_w + 5, py + font_small.size + 2]
             draw.rectangle(box, fill=255, outline=0)
             draw.text((px, py), partial, font=font_small, fill=0)
 
-
-
-        # ---- Paste Tulip + Note ----
         final.paste(tulip_l, (275, 0))
         final.paste(note_img, (550, 0))
 
-        # ---- CAP ----
         cap = wpt.findtext('default:extensions/openrally:cap', default="", namespaces=ns)
         cap_bbox = draw.textbbox((0, 0), cap, font=font_small)
         cap_box_width = cap_bbox[2] - cap_bbox[0]
@@ -457,8 +481,8 @@ def render_row(wpt, prev_wpt=None):
         )
         draw.text((cap_box_x, cap_box_y), cap, font=font_small, fill=0)
 
-        # ---- Marker (S, P, M) ----
-        for tag, label in [('wps', 'S'), ('wpp', 'P'), ('wpm', 'M'),('dss', 'DSS'),('ass', 'ASS'),('dz', 'DZ'),('fz', 'FZ'),('wpe', 'E'),('wpv', 'V'),('checkpoint', 'C'),('neutralization', 'N')]:
+        for tag, label in [('wps', 'S'), ('wpp', 'P'), ('wpm', 'M'), ('dss', 'DSS'), ('ass', 'ASS'), ('dz', 'DZ'),
+                           ('fz', 'FZ'), ('wpe', 'E'), ('wpv', 'V'), ('checkpoint', 'C'), ('neutralization', 'N')]:
             elem = wpt.find(f'default:extensions/openrally:{tag}', ns)
             if elem is not None:
                 cx, cy = 275 - 35, 130
@@ -474,7 +498,6 @@ def render_row(wpt, prev_wpt=None):
                 draw.text((cx - tw // 2, cy - th // 2 - 10), label, font=font_marker, fill=0)
                 break
 
-        # ---- Waypoint Name Box ----
         wpt_name = wpt.findtext('default:name', default="", namespaces=ns)
         name_bbox = draw.textbbox((0, 0), wpt_name, font=font_small)
         name_box_width = name_bbox[2] - name_bbox[0]
@@ -486,16 +509,13 @@ def render_row(wpt, prev_wpt=None):
         )
         draw.text((name_box_x, name_box_y), wpt_name, font=font_small, fill=255)
 
-        # ---- Row Box Layout ----
         draw.rectangle([0, 0, 824, 199], outline=0)
         draw.line([(275, 0), (275, 199)], fill=0)
         draw.line([(550, 0), (550, 199)], fill=0)
 
-# ---- 5px border if WPS ----
         if wpt.find('default:extensions/openrally:wps', ns) is not None:
             draw.rectangle([0, 0, 824, 199], outline=0, width=5)
 
-# ---- Special Index in Circle (bottom-right of note) ----
         for tag in special_tags:
             if wpt.find(f'default:extensions/openrally:{tag}', ns) is not None:
                 circle_text = f"{rendered_special_idx}"
@@ -509,17 +529,17 @@ def render_row(wpt, prev_wpt=None):
                 cy = 200 - r - 5
 
                 draw.ellipse([cx - r, cy - r, cx + r, cy + r], outline=0, fill=255)
-                draw.text((cx - tw // 2, cy - th // 2 -6), circle_text, font=font_small, fill=0)
+                draw.text((cx - tw // 2, cy - th // 2 - 6), circle_text, font=font_small, fill=0)
 
                 globals()["rendered_special_idx"] += 1
                 break
-
 
         return final
 
     except Exception as e:
         print("Error rendering waypoint:", e)
         return None
+
 
 # ---------------------- Render All Rows ----------------------
 rendered_rows = []
@@ -532,37 +552,33 @@ for i, wpt in enumerate(waypoints):
 
 current_index = 0
 
+
 # ---------------------- Build Strip ----------------------
 def render_strip(start_idx):
     if start_idx + 2 >= len(rendered_rows):
         return
     strip = Image.new("L", (825, 604), 255)
-    # for j in range(3):
-    #     strip.paste(rendered_rows[start_idx + j], (0, j * 200))
     for j in range(3):
-        idx = start_idx + 2 - j  # reverse order: 2,1,0
+        idx = start_idx + 2 - j
         strip.paste(rendered_rows[idx], (0, j * 200))
     final = strip.rotate(90, expand=True).quantize(colors=16)
     final.save(TMP_PATH, format="BMP")
     os.replace(TMP_PATH, OUTPUT_PATH)
 
+    print(f"Wrote {OUTPUT_PATH} for waypoints {start_idx + 1}-{start_idx + 3}")
 
-#    if update_gps():
-#        render_gps_strip()
-
-    print(f"Wrote {OUTPUT_PATH} for waypoints {start_idx+1}-{start_idx+3}")
 
 render_strip(current_index)
+
 
 # ---------------------- GPS Loop ----------------------
 def gps_loop():
     while True:
-#        print("[DEBUG] Waiting for GPS update...")
         if update_gps():
             start = time.time()
             render_gps_strip()
             print(f"[DEBUG] GPS render took {time.time() - start:.3f} sec")
-        time.sleep(2)  # adjust for your update rate
+        time.sleep(2)
 
 
 # ---------------------- Button Input Loop ----------------------
@@ -575,21 +591,19 @@ def button_loop():
             if event.type == ecodes.EV_KEY:
                 t = now() * 1000
 
-                # Print readable key name
                 try:
                     keyname = ecodes.KEY[event.code]
-                except:
+                except Exception:
                     keyname = str(event.code)
                 print(f"[EVENT] code={event.code} ({keyname}), value={event.value}, time={int(t)}")
 
-                # Exit on KEY_PLAYPAUSE
                 if event.value == 1 and event.code == 164:
                     print("Special combo button (164) pressed — exiting...")
                     os._exit(0)
 
-                if event.value == 1:  # key down
+                if event.value == 1:
                     pressed_keys.add(event.code)
-                elif event.value == 0:  # key up
+                elif event.value == 0:
                     pressed_keys.discard(event.code)
                 else:
                     continue
@@ -598,19 +612,18 @@ def button_loop():
                     continue
                 last_button_time = t
 
-                # Handle single key actions
                 if event.value == 1:
-                    if event.code == 115:  # VOLUMEUP
+                    if event.code == 115:
                         total_distance_km += 0.1
                         render_gps_strip()
-                    elif event.code == 114:  # VOLUMEDOWN
+                    elif event.code == 114:
                         total_distance_km = max(0.0, total_distance_km - 0.1)
                         render_gps_strip()
-                    elif event.code == 165:  # NEXT
+                    elif event.code == 165:
                         if current_index < len(rendered_rows) - 3:
                             current_index += 1
                             render_strip(current_index)
-                    elif event.code == 163:  # PREV
+                    elif event.code == 163:
                         if current_index > 0:
                             current_index -= 1
                             render_strip(current_index)
@@ -621,9 +634,8 @@ def button_loop():
 
 
 def system_monitor():
-    log_path = "/home/ben/system.log"
-    os.makedirs(os.path.dirname(log_path), exist_ok=True)
-    with open(log_path, "a") as log:
+    os.makedirs(os.path.dirname(SYSTEM_LOG_PATH), exist_ok=True)
+    with open(SYSTEM_LOG_PATH, "a") as log:
         log.write(f"\n\n=== BOOT @ {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
 
     while True:
@@ -632,16 +644,18 @@ def system_monitor():
             throttle = os.popen("vcgencmd get_throttled").read().strip() or "throttled=?"
             volts = os.popen("vcgencmd measure_volts").read().strip() or "volt=?"
             devices = ",".join(os.listdir("/dev/input"))
+
             try:
-                gps_alive = bool(gps_port and gps_port.is_open)
+                with gps_lock:
+                    gps_alive = bool(gps_port is not None and gps_port.is_open)
             except Exception:
                 gps_alive = False
 
-            with open(log_path, "a") as log:
+            with open(SYSTEM_LOG_PATH, "a") as log:
                 log.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] ")
                 log.write(f"Temp: {temp} | Throttle: {throttle} | Volts: {volts} | GPS open: {gps_alive} | Input devs: {devices}\n")
         except Exception as e:
-            with open(log_path, "a") as log:
+            with open(SYSTEM_LOG_PATH, "a") as log:
                 log.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] [MONITOR ERROR] {e}\n")
         time.sleep(10)
 
@@ -655,11 +669,11 @@ def run_thread(target, name):
             except Exception as e:
                 err = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] [CRASH] {name}: {e}\n"
                 print(err)
-                with open("/home/ben/system.log", "a") as log:
+                with open(SYSTEM_LOG_PATH, "a") as log:
                     log.write(err)
-                    import traceback
                     traceback.print_exc(file=log)
             time.sleep(2)
+
     t = threading.Thread(target=loop, daemon=True)
     t.start()
     return t

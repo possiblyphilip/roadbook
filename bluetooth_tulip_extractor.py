@@ -1,8 +1,9 @@
 import base64
 import io
+import json
 import os
 import threading
-from PIL import Image, ImageDraw, ImageFont, ImageEnhance
+from PIL import Image, ImageDraw, ImageFont
 import xml.etree.ElementTree as ET
 import numpy as np
 from evdev import InputDevice, ecodes
@@ -14,15 +15,12 @@ import traceback
 
 
 # ---------------------- Config ----------------------
-#GPX_FILE = "digicomp_millican.gpx"
-#GPX_FILE = "w_25_r1_tp.gpx"
-#GPX_FILE = "daycare.gpx"
-
 if len(sys.argv) < 2:
-    print("Usage: python bluetooth_tulip_extractor.py <GPX_FILE>")
+    print("Usage: python bluetooth_tulip_extractor.py <GPX_FILE> [--resume|--start-over]")
     sys.exit(1)
 
 GPX_FILE = sys.argv[1]
+START_MODE = sys.argv[2] if len(sys.argv) >= 3 else "--resume"
 
 OUTPUT_PATH = "/tmp/eink_note.bmp"
 GPS_OUTPUT_PATH = "/tmp/eink_gps.bmp"
@@ -35,15 +33,13 @@ GPS_DEVICE = "/dev/ttyACM0"
 GPS_BAUDRATE = 9600
 
 MOVEMENT_THRESHOLD_KM = 0.005  # ~5 m
-#MOVEMENT_THRESHOLD_KM = 0.0001  # ~5 m
 
 last_button_time = 0
 DEBOUNCE_MS = 100
-combo_start_time = None
-COMBO_HOLD_MS = 700
 
 gps_port = None
 gps_lock = threading.Lock()
+state_lock = threading.Lock()
 
 last_latlon = None
 total_distance_km = 0.0
@@ -53,6 +49,12 @@ current_speed_limit = None
 current_speed_kmh = 0.0
 waypoint_count = 0
 special_wpts = []
+special_idx = 0
+current_index = 0
+
+session_start_time = time.time()
+loaded_elapsed_seconds = 0.0
+last_saved_elapsed_seconds = 0.0
 
 ns = {
     'default': 'http://www.topografix.com/GPX/1/1',
@@ -75,6 +77,27 @@ special_tags = [
     'wpv', 'wpp', 'wpn', 'checkpoint', 'fn', 'dt', 'ft', 'neutralization', 'speed'
 ]
 
+ROADBOOK_LOG_DIR = os.path.join(os.path.dirname(GPX_FILE), ".roadbook_logs")
+ROADBOOK_BASENAME = os.path.splitext(os.path.basename(GPX_FILE))[0]
+ROADBOOK_STATE_PATH = os.path.join(ROADBOOK_LOG_DIR, f"{ROADBOOK_BASENAME}.json")
+ROADBOOK_EVENT_LOG_PATH = os.path.join(ROADBOOK_LOG_DIR, f"{ROADBOOK_BASENAME}.csv")
+
+
+def get_elapsed_seconds():
+    return loaded_elapsed_seconds + max(0.0, time.time() - session_start_time)
+
+
+def format_elapsed(seconds):
+    total = int(max(0, seconds))
+    hours = total // 3600
+    minutes = (total % 3600) // 60
+    secs = total % 60
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def ensure_log_dir():
+    os.makedirs(ROADBOOK_LOG_DIR, exist_ok=True)
+
 
 def log_system_line(message):
     try:
@@ -83,6 +106,101 @@ def log_system_line(message):
             log.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {message}\n")
     except Exception:
         pass
+
+
+def init_event_log():
+    ensure_log_dir()
+    if not os.path.exists(ROADBOOK_EVENT_LOG_PATH):
+        with open(ROADBOOK_EVENT_LOG_PATH, "w") as f:
+            f.write("timestamp,event,total_distance_km,current_index,special_idx,elapsed_seconds,details\n")
+
+
+def append_event(event_type, details=""):
+    try:
+        ensure_log_dir()
+        init_event_log()
+        with open(ROADBOOK_EVENT_LOG_PATH, "a") as f:
+            f.write(
+                f"{time.strftime('%Y-%m-%d %H:%M:%S')},"
+                f"{event_type},"
+                f"{total_distance_km:.3f},"
+                f"{current_index},"
+                f"{special_idx},"
+                f"{int(get_elapsed_seconds())},"
+                f"{str(details).replace(',', ';')}\n"
+            )
+    except Exception as e:
+        log_system_line(f"[ROADBOOK EVENT LOG ERROR] {e}")
+
+
+def save_run_state(reason="periodic"):
+    global last_saved_elapsed_seconds
+
+    try:
+        ensure_log_dir()
+        state = {
+            "gpx_file": GPX_FILE,
+            "gpx_basename": os.path.basename(GPX_FILE),
+            "saved_at": time.strftime('%Y-%m-%d %H:%M:%S'),
+            "reason": reason,
+            "total_distance_km": round(total_distance_km, 3),
+            "current_index": int(current_index),
+            "special_idx": int(special_idx),
+            "waypoint_count": int(waypoint_count),
+            "heading_deg": round(heading_deg, 1),
+            "elapsed_seconds": int(get_elapsed_seconds()),
+            "current_speed_kmh": round(current_speed_kmh, 1),
+            "current_speed_limit": None if current_speed_limit is None else round(float(current_speed_limit), 1),
+            "show_speed": bool(show_speed),
+            "last_latlon": list(last_latlon) if last_latlon else None,
+            "state_path": ROADBOOK_STATE_PATH,
+            "event_log_path": ROADBOOK_EVENT_LOG_PATH,
+        }
+        tmp = ROADBOOK_STATE_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(state, f, indent=2)
+        os.replace(tmp, ROADBOOK_STATE_PATH)
+        last_saved_elapsed_seconds = state["elapsed_seconds"]
+    except Exception as e:
+        log_system_line(f"[ROADBOOK SAVE ERROR] {e}")
+
+
+def load_run_state():
+    global total_distance_km, current_index, special_idx, heading_deg
+    global loaded_elapsed_seconds, session_start_time, last_latlon
+    global current_speed_limit, show_speed
+
+    if START_MODE == "--start-over":
+        if os.path.exists(ROADBOOK_STATE_PATH):
+            try:
+                os.remove(ROADBOOK_STATE_PATH)
+            except Exception as e:
+                log_system_line(f"[ROADBOOK RESET STATE REMOVE ERROR] {e}")
+        append_event("start_over", "state reset requested")
+        return
+
+    if not os.path.exists(ROADBOOK_STATE_PATH):
+        append_event("new_run", "no previous state")
+        return
+
+    try:
+        with open(ROADBOOK_STATE_PATH, "r") as f:
+            state = json.load(f)
+
+        total_distance_km = float(state.get("total_distance_km", 0.0))
+        current_index = int(state.get("current_index", 0))
+        special_idx = int(state.get("special_idx", 0))
+        heading_deg = float(state.get("heading_deg", 0.0))
+        loaded_elapsed_seconds = float(state.get("elapsed_seconds", 0.0))
+        latlon = state.get("last_latlon")
+        last_latlon = tuple(latlon) if isinstance(latlon, list) and len(latlon) == 2 else None
+        current_speed_limit = state.get("current_speed_limit")
+        show_speed = bool(state.get("show_speed", False))
+        session_start_time = time.time()
+        append_event("resume", f"loaded state from {state.get('saved_at', 'unknown')}")
+    except Exception as e:
+        log_system_line(f"[ROADBOOK LOAD ERROR] {e}")
+        append_event("resume_failed", e)
 
 
 def open_gps():
@@ -124,12 +242,12 @@ for wpt in waypoints:
     for tag in special_tags:
         elem = wpt.find(f'default:extensions/openrally:{tag}', ns)
         if elem is not None:
-            name = wpt.findtext('default:name', default="(no name)", namespaces=ns)
-            print(f"Matched tag '{tag}' in waypoint '{name}'")
             waypoint_count += 1
 
             open_attr = elem.get("open")
             clear_attr = elem.get("clear")
+            name = wpt.findtext('default:name', default="(no name)", namespaces=ns)
+
             if open_attr and clear_attr:
                 speed_elem = wpt.find("default:extensions/openrally:speed", ns)
                 speed_value = None
@@ -145,13 +263,17 @@ for wpt in waypoints:
                     "lon": lon,
                     "open": float(open_attr) / 1000,
                     "clear": float(clear_attr) / 1000,
-                    "speed": speed_value
+                    "speed": speed_value,
+                    "name": name,
+                    "tag": tag,
                 })
             break
 
-special_idx = 0
-
 print(f"Total tagged waypoints: {waypoint_count}")
+
+init_event_log()
+load_run_state()
+save_run_state("startup")
 
 # Open GPS on startup, but don't die if it fails
 recover_gps("startup")
@@ -162,7 +284,9 @@ def haversine(lat1, lon1, lat2, lon2):
     R = 6371.0
     phi1, lam1 = math.radians(lat1), math.radians(lon1)
     phi2, lam2 = math.radians(lat2), math.radians(lon2)
-    dphi, dlam = phi2 - phi1, lam2 - lam1
+    dphi, dlam = phi2 - phi1, phi2 - phi1
+    dphi = phi2 - phi1
+    dlam = lam2 - lam1
     a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlam / 2) ** 2
     return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
@@ -199,8 +323,6 @@ def update_gps():
 
     line = None
     current_speed_kmh = 0.0
-    show_speed = False
-    current_speed_limit = None
 
     if gps_port is None:
         if not recover_gps("gps_port is None in update_gps"):
@@ -257,30 +379,36 @@ def update_gps():
                 with open(GPS_LOG_PATH, "a") as f:
                     f.write(f"{time.time()},{lat},{lon},{total_distance_km:.3f},{heading_deg:.1f}\n")
 
+                hit_details = None
                 if special_idx < len(special_wpts):
                     sp = special_wpts[special_idx]
                     dist_to_sp = haversine(new_point[0], new_point[1], sp["lat"], sp["lon"])
 
                     if dist_to_sp < sp["clear"]:
-                        xpath = f".//default:wpt[@lat='{sp['lat']}'][@lon='{sp['lon']}']"
-                        wpt_elem = root.find(xpath, ns)
+                        current_speed_limit = None
+                        show_speed = False
 
-                        if wpt_elem is not None:
-                            fz_elem = wpt_elem.find("default:extensions/openrally:fz", ns)
-                            if fz_elem is not None:
-                                show_speed = False
-                                current_speed_limit = None
-                            elif sp.get("speed") is not None:
-                                current_speed_limit = sp["speed"]
-                                show_speed = True
+                        if sp.get("tag") == "fz":
+                            show_speed = False
+                            current_speed_limit = None
+                        elif sp.get("speed") is not None:
+                            current_speed_limit = sp["speed"]
+                            show_speed = True
 
+                        hit_details = f"{sp['index']}:{sp['tag']}:{sp['name']}"
+                        append_event("waypoint_hit", hit_details)
                         special_idx += 1
+
+                save_run_state("gps_move")
+                if hit_details:
+                    log_system_line(f"[ROADBOOK] waypoint hit {hit_details}")
 
                 return True
             else:
                 return True
         else:
             last_latlon = new_point
+            save_run_state("first_fix")
             return True
 
     except Exception as e:
@@ -324,31 +452,31 @@ def render_gps_strip():
     index_str = f"{special_idx}/{waypoint_count}"
     draw.text((10, 175), index_str, font=font_small, fill=255)
 
+    elapsed_str = format_elapsed(get_elapsed_seconds())
+    elapsed_bbox = draw.textbbox((0, 0), elapsed_str, font=font_small)
+    elapsed_w = elapsed_bbox[2] - elapsed_bbox[0]
+    draw.text((275 - elapsed_w - 10, 175), elapsed_str, font=font_small, fill=255)
+
     if show_speed and current_speed_limit is not None:
         speed_str = f"{current_speed_kmh:.0f} / {current_speed_limit:.0f} km/h"
-        draw.text((560, 175), speed_str, font=font_small, fill=255)
+        speed_bbox = draw.textbbox((0, 0), speed_str, font=font_small)
+        speed_w = speed_bbox[2] - speed_bbox[0]
+        draw.text((824 - speed_w - 10, 175), speed_str, font=font_small, fill=255)
 
     # ---- Middle Panel: Arrow toward special_idx if inside open radius ----
     if special_idx < len(special_wpts):
         sp = special_wpts[special_idx]
         if last_latlon:
             dist_to_sp = haversine(last_latlon[0], last_latlon[1], sp["lat"], sp["lon"])
-            print(f"[DEBUG] dist_to_sp = {dist_to_sp:.3f} km")
             if dist_to_sp < sp["open"]:
                 sp_bearing = bearing(last_latlon[0], last_latlon[1], sp["lat"], sp["lon"])
                 rel_bearing = (sp_bearing - heading_deg + 360) % 360
-
-                print(f"[DEBUG] sp_bearing = {sp_bearing:.1f}°")
-                print(f"[DEBUG] heading_deg = {heading_deg:.1f}°")
-                print(f"[DEBUG] rel_bearing = {rel_bearing:.1f}°")
 
                 center_x, center_y = 412, 100
                 length = 60
                 angle_rad = math.radians(rel_bearing)
                 end_x = center_x + length * math.sin(angle_rad)
                 end_y = center_y - length * math.cos(angle_rad)
-
-                print(f"[DEBUG] arrow tip: ({end_x:.1f}, {end_y:.1f})")
 
                 draw.line([(center_x, center_y), (end_x, end_y)], fill=0, width=5)
 
@@ -392,9 +520,7 @@ def stretch_contrast(img_l):
 
 
 # ---------------------- Render Row ----------------------
-def render_row(wpt, prev_wpt=None):
-    global rendered_special_idx
-
+def render_row(wpt, prev_wpt=None, row_special_number=None):
     try:
         partial = ""
         partial_km = None
@@ -516,23 +642,19 @@ def render_row(wpt, prev_wpt=None):
         if wpt.find('default:extensions/openrally:wps', ns) is not None:
             draw.rectangle([0, 0, 824, 199], outline=0, width=5)
 
-        for tag in special_tags:
-            if wpt.find(f'default:extensions/openrally:{tag}', ns) is not None:
-                circle_text = f"{rendered_special_idx}"
+        if row_special_number is not None:
+            circle_text = f"{row_special_number}"
 
-                tbbox = draw.textbbox((0, 0), circle_text, font=font_small)
-                tw = tbbox[2] - tbbox[0]
-                th = tbbox[3] - tbbox[1]
-                r = max(tw, th) // 2 + 8
+            tbbox = draw.textbbox((0, 0), circle_text, font=font_small)
+            tw = tbbox[2] - tbbox[0]
+            th = tbbox[3] - tbbox[1]
+            r = max(tw, th) // 2 + 8
 
-                cx = 825 - r - 10
-                cy = 200 - r - 5
+            cx = 825 - r - 10
+            cy = 200 - r - 5
 
-                draw.ellipse([cx - r, cy - r, cx + r, cy + r], outline=0, fill=255)
-                draw.text((cx - tw // 2, cy - th // 2 - 6), circle_text, font=font_small, fill=0)
-
-                globals()["rendered_special_idx"] += 1
-                break
+            draw.ellipse([cx - r, cy - r, cx + r, cy + r], outline=0, fill=255)
+            draw.text((cx - tw // 2, cy - th // 2 - 6), circle_text, font=font_small, fill=0)
 
         return final
 
@@ -543,42 +665,54 @@ def render_row(wpt, prev_wpt=None):
 
 # ---------------------- Render All Rows ----------------------
 rendered_rows = []
-rendered_special_idx = 1
+row_special_number = 1
 for i, wpt in enumerate(waypoints):
     prev = waypoints[i - 1] if i > 0 else None
-    row = render_row(wpt, prev)
+    has_special = any(wpt.find(f'default:extensions/openrally:{tag}', ns) is not None for tag in special_tags)
+    row = render_row(wpt, prev, row_special_number if has_special else None)
     if row:
         rendered_rows.append(row)
-
-current_index = 0
+    if has_special:
+        row_special_number += 1
 
 
 # ---------------------- Build Strip ----------------------
 def render_strip(start_idx):
-    if start_idx + 2 >= len(rendered_rows):
+    if not rendered_rows:
         return
+
+    start_idx = max(0, min(start_idx, len(rendered_rows) - 1))
+    if start_idx + 2 >= len(rendered_rows):
+        start_idx = max(0, len(rendered_rows) - 3)
+
     strip = Image.new("L", (825, 604), 255)
     for j in range(3):
-        idx = start_idx + 2 - j
+        idx = min(start_idx + 2 - j, len(rendered_rows) - 1)
         strip.paste(rendered_rows[idx], (0, j * 200))
     final = strip.rotate(90, expand=True).quantize(colors=16)
     final.save(TMP_PATH, format="BMP")
     os.replace(TMP_PATH, OUTPUT_PATH)
 
-    print(f"Wrote {OUTPUT_PATH} for waypoints {start_idx + 1}-{start_idx + 3}")
+    print(f"Wrote {OUTPUT_PATH} for waypoints {start_idx + 1}-{min(start_idx + 3, len(rendered_rows))}")
 
 
 render_strip(current_index)
+render_gps_strip()
 
 
 # ---------------------- GPS Loop ----------------------
 def gps_loop():
     while True:
         if update_gps():
-            start = time.time()
             render_gps_strip()
-            print(f"[DEBUG] GPS render took {time.time() - start:.3f} sec")
         time.sleep(2)
+
+
+# ---------------------- State Saver Loop ----------------------
+def state_saver_loop():
+    while True:
+        save_run_state("heartbeat")
+        time.sleep(5)
 
 
 # ---------------------- Button Input Loop ----------------------
@@ -599,6 +733,8 @@ def button_loop():
 
                 if event.value == 1 and event.code == 164:
                     print("Special combo button (164) pressed — exiting...")
+                    append_event("exit_button", "key 164")
+                    save_run_state("exit_button")
                     os._exit(0)
 
                 if event.value == 1:
@@ -615,17 +751,25 @@ def button_loop():
                 if event.value == 1:
                     if event.code == 115:
                         total_distance_km += 0.1
+                        append_event("odo_adjust", "+0.1")
+                        save_run_state("odo_adjust_up")
                         render_gps_strip()
                     elif event.code == 114:
                         total_distance_km = max(0.0, total_distance_km - 0.1)
+                        append_event("odo_adjust", "-0.1")
+                        save_run_state("odo_adjust_down")
                         render_gps_strip()
                     elif event.code == 165:
                         if current_index < len(rendered_rows) - 3:
                             current_index += 1
+                            append_event("scroll", "next")
+                            save_run_state("scroll_next")
                             render_strip(current_index)
                     elif event.code == 163:
                         if current_index > 0:
                             current_index -= 1
+                            append_event("scroll", "prev")
+                            save_run_state("scroll_prev")
                             render_strip(current_index)
     except FileNotFoundError:
         print(f"Device {INPUT_EVENT} not found. Exiting.")
@@ -681,6 +825,7 @@ def run_thread(target, name):
 
 run_thread(button_loop, "button_loop")
 run_thread(gps_loop, "gps_loop")
+run_thread(state_saver_loop, "state_saver_loop")
 threading.Thread(target=system_monitor, daemon=True).start()
 
 threading.Event().wait()
